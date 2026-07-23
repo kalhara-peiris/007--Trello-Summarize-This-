@@ -15,7 +15,9 @@ function startBackendServer(options = {}) {
 
   return new Promise((resolve, reject) => {
     server.once("error", reject);
-    server.listen(options.port || config.PORT, options.host || config.HOST, () => {
+    const port = Object.prototype.hasOwnProperty.call(options, "port") ? options.port : config.PORT;
+    const host = Object.prototype.hasOwnProperty.call(options, "host") ? options.host : config.HOST;
+    server.listen(port, host, () => {
       resolve({ server, app });
     });
   });

@@ -135,7 +135,7 @@ class AttachmentProcessor {
             ...attachment,
             processed: true,
             type: this.detectType(attachment),
-            extractionStatus: 'text-extracted',
+            extractionStatus: truncated ? 'truncated' : 'text-extracted',
             extractedText: extractedText,
             content: `Text attachment: ${attachment.name || 'Attachment'}\n\n${extractedText}${truncated ? '\n\n[Content truncated before analysis]' : ''}`,
             metadata: {
@@ -201,7 +201,7 @@ class AttachmentProcessor {
             ...attachment,
             processed: true,
             type: 'pdf',
-            extractionStatus: 'pdf-text-extracted',
+            extractionStatus: truncated ? 'truncated' : 'text-extracted',
             extractedText: extractedText,
             content: `PDF attachment: ${attachment.name || 'Attachment'}\n\n${extractedText}${truncated ? '\n\n[PDF text truncated before analysis]' : ''}`,
             metadata: {
@@ -372,35 +372,19 @@ class AttachmentProcessor {
 
     // Process Word documents
     async processWord(attachment) {
-        try {
-            // For browser environment, Word processing is complex
-            // Would require mammoth.js or similar library
-            
-            const response = await this.safeFetchAttachment(attachment.url);
-            if (!response.ok) {
-                throw new Error(`Failed to fetch Word document: ${response.statusText}`);
+        return {
+            ...attachment,
+            processed: false,
+            type: 'word',
+            extractionStatus: 'unsupported',
+            extractedText: '',
+            content: `Word document: ${attachment.name || 'Attachment'}\n\nUnsupported in the shipped browser flow. Metadata is available, but document text is not extracted.`,
+            metadata: {
+                size: attachment.bytes || 0,
+                formattedSize: this.formatBytes(attachment.bytes || 0),
+                type: 'word'
             }
-
-            const blob = await response.blob();
-            const size = this.formatBytes(blob.size);
-
-            // Return metadata for now
-            // TODO: Implement actual Word document parsing with mammoth.js
-            return {
-                ...attachment,
-                processed: true,
-                type: 'word',
-                extractedText: '',
-                content: `Word Document: ${attachment.name} (${size})\n\nNote: Word document text extraction requires mammoth.js library. Currently showing metadata only.`,
-                metadata: {
-                    size: blob.size,
-                    formattedSize: size,
-                    type: 'word'
-                }
-            };
-        } catch (error) {
-            throw new Error(`Word processing failed: ${error.message}`);
-        }
+        };
     }
 
     // Process Excel spreadsheets
@@ -435,14 +419,13 @@ class AttachmentProcessor {
                 };
             }
 
-            // For Excel files, would need xlsx.js library
-            // TODO: Implement Excel parsing with xlsx.js
             return {
                 ...attachment,
-                processed: true,
+                processed: false,
                 type: 'excel',
+                extractionStatus: 'unsupported',
                 extractedText: '',
-                content: `Excel Spreadsheet: ${attachment.name} (${size})\n\nNote: Excel file parsing requires xlsx.js library. Currently showing metadata only.`,
+                content: `Excel spreadsheet: ${attachment.name} (${size})\n\nUnsupported in the shipped browser flow. Metadata is available, but workbook text is not extracted.`,
                 metadata: {
                     size: blob.size,
                     formattedSize: size,
@@ -470,6 +453,7 @@ class AttachmentProcessor {
                 ...attachment,
                 processed: true,
                 type: 'text',
+                extractionStatus: text.length > 1000 ? 'truncated' : 'text-extracted',
                 extractedText: text,
                 content: `Text File: ${attachment.name}\n\n${text.length > 1000 ? preview + '\n\n[Content truncated - ' + lines.length + ' total lines]' : text}`,
                 metadata: {
@@ -495,18 +479,13 @@ class AttachmentProcessor {
             const blob = await response.blob();
             const size = this.formatBytes(blob.size);
 
-            // Create object URL for preview
-            const objectUrl = URL.createObjectURL(blob);
-
-            // For OCR, would need Tesseract.js
-            // TODO: Implement OCR with Tesseract.js
             return {
                 ...attachment,
-                processed: true,
+                processed: false,
                 type: 'image',
+                extractionStatus: 'unsupported',
                 extractedText: '',
-                content: `Image: ${attachment.name} (${size})\n\nNote: OCR text extraction from images requires Tesseract.js library. Currently showing metadata only.`,
-                previewUrl: objectUrl,
+                content: `Image: ${attachment.name} (${size})\n\nUnsupported in the shipped browser flow. Metadata is available, but OCR text is not extracted.`,
                 metadata: {
                     size: blob.size,
                     formattedSize: size,
@@ -548,6 +527,7 @@ class AttachmentProcessor {
             ...attachment,
             processed: false,
             type: 'unknown',
+            extractionStatus: 'unsupported',
             content: `Unsupported file type: ${attachment.name}\nMIME type: ${attachment.mimeType || 'unknown'}`,
             metadata: {
                 size: attachment.bytes,

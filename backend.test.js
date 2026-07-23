@@ -1,5 +1,8 @@
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
 const http = require("node:http");
+const os = require("node:os");
+const path = require("node:path");
 
 process.env.JWT_SECRET = process.env.JWT_SECRET || "test-secret";
 process.env.ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin-secret";
@@ -50,7 +53,8 @@ async function requestJson(baseUrl, method, path, body, headers = {}) {
 }
 
 async function main() {
-  const { server } = await startBackendServer({ host: "127.0.0.1", port: 0, allowMissingEnv: false });
+  const storagePath = path.join(os.tmpdir(), `summarize-this-backend-${Date.now()}.json`);
+  const { server } = await startBackendServer({ host: "127.0.0.1", port: 0, allowMissingEnv: false, storagePath });
   const address = server.address();
   const baseUrl = `http://${address.address}:${address.port}`;
 
@@ -76,11 +80,32 @@ async function main() {
     });
     assert.equal(profile.status, 200);
     assert.equal(profile.data.user.email, "test@example.com");
+    assert.ok(fs.existsSync(storagePath));
+
+    const logout = await requestJson(baseUrl, "POST", "/api/auth/logout", undefined, {
+      Authorization: `Bearer ${token}`
+    });
+    assert.equal(logout.status, 200);
+
+    const profileAfterLogout = await requestJson(baseUrl, "GET", "/api/user/profile", undefined, {
+      Authorization: `Bearer ${token}`
+    });
+    assert.equal(profileAfterLogout.status, 401);
+
+    const relogin = await requestJson(baseUrl, "POST", "/api/auth/login", {
+      email: "test@example.com",
+      password: "correct-password"
+    }, {
+      "Idempotency-Key": "login-replay-test"
+    });
+    assert.equal(relogin.status, 200);
+    assert.ok(relogin.data.token);
+    const token2 = relogin.data.token;
 
     const shortSummary = await requestJson(baseUrl, "POST", "/api/summarize", {
       text: "too short"
     }, {
-      Authorization: `Bearer ${token}`
+      Authorization: `Bearer ${token2}`
     });
     assert.equal(shortSummary.status, 400);
 
@@ -89,7 +114,7 @@ async function main() {
       proxy: { enabled: true },
       provider: { apiKey: "browser-key-should-not-pass" }
     }, {
-      Authorization: `Bearer ${token}`
+      Authorization: `Bearer ${token2}`
     });
     assert.equal(proxyGuard.status, 422);
 
@@ -97,7 +122,7 @@ async function main() {
       text: "This text is definitely long enough to be summarized safely in the backend contract test case.",
       provider: { apiKey: "browser-key-should-not-pass" }
     }, {
-      Authorization: `Bearer ${token}`
+      Authorization: `Bearer ${token2}`
     });
     assert.equal(directModeBlocked.status, 422);
 
@@ -105,19 +130,30 @@ async function main() {
       text: "This text is definitely long enough to be summarized safely in the backend contract test case.",
       method: "hybrid"
     }, {
-      Authorization: `Bearer ${token}`
+      Authorization: `Bearer ${token2}`,
+      "Idempotency-Key": "summary-contract-test"
     });
     assert.equal(summary.status, 200);
     assert.equal(summary.data.result.providerMode, "local");
 
+    const summaryReplay = await requestJson(baseUrl, "POST", "/api/summarize", {
+      text: "This text is definitely long enough to be summarized safely in the backend contract test case.",
+      method: "hybrid"
+    }, {
+      Authorization: `Bearer ${token2}`,
+      "Idempotency-Key": "summary-contract-test"
+    });
+    assert.equal(summaryReplay.status, 200);
+    assert.equal(summaryReplay.data.idempotentReplay, true);
+
     const credits = await requestJson(baseUrl, "GET", "/api/user/credits", undefined, {
-      Authorization: `Bearer ${token}`
+      Authorization: `Bearer ${token2}`
     });
     assert.equal(credits.status, 200);
     assert.equal(typeof credits.data.credits, "number");
 
     const activity = await requestJson(baseUrl, "GET", "/api/user/activity", undefined, {
-      Authorization: `Bearer ${token}`
+      Authorization: `Bearer ${token2}`
     });
     assert.equal(activity.status, 200);
     assert.ok(Array.isArray(activity.data.activities));
@@ -126,7 +162,7 @@ async function main() {
       package: "basic",
       paymentMethodId: "pm_test"
     }, {
-      Authorization: `Bearer ${token}`
+      Authorization: `Bearer ${token2}`
     });
     assert.equal(purchase.status, 200);
 
@@ -336,6 +372,7 @@ async function main() {
     }
   } finally {
     await new Promise((resolve) => server.close(resolve));
+    fs.rmSync(storagePath, { force: true });
   }
 
   console.log("Backend contract tests passed.");

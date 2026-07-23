@@ -1,45 +1,18 @@
 const crypto = require("node:crypto");
 const { URL } = require("node:url");
 const config = require("./backend-config");
+const {
+  createId,
+  createSession,
+  hashPassword,
+  loadStore,
+  revokeSession,
+  touchSession,
+  verifyPassword
+} = require("./backend-storage");
 
-function createId() {
-  if (typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return crypto.randomBytes(16).toString("hex");
-}
-
-function createStore() {
-  return {
-    users: [
-      {
-        id: "seed-user",
-        email: "test@example.com",
-        password: "correct-password",
-        name: "Test User",
-        credits: 100,
-        role: "user",
-        createdAt: "2026-07-01T00:00:00.000Z"
-      }
-    ],
-    tokens: new Map(),
-    summaries: [],
-    transactions: [],
-    events: [],
-    reviews: [],
-    proxyUsage: {},
-    systemAlerts: [],
-    settingsHistory: [],
-    reports: [],
-    backups: [],
-    maintenanceWindows: [],
-    files: [],
-    settings: {
-      proxyEndpoint: "",
-      providerMode: "local",
-      trelloKeyConfigured: false
-    }
-  };
+function createStore(storagePath) {
+  return loadStore(storagePath);
 }
 
 function clonePublicUser(user) {
@@ -55,6 +28,7 @@ function clonePublicUser(user) {
 
 function json(res, status, payload, headers) {
   const body = JSON.stringify(payload);
+  maybePersistResponseState(res, status);
   res.writeHead(status, Object.assign({
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store"
@@ -63,11 +37,20 @@ function json(res, status, payload, headers) {
 }
 
 function text(res, status, body) {
+  maybePersistResponseState(res, status);
   res.writeHead(status, {
     "Content-Type": "text/plain; charset=utf-8",
     "Cache-Control": "no-store"
   });
   res.end(body);
+}
+
+function maybePersistResponseState(res, status) {
+  if (!res || typeof res.__persist !== "function") return;
+  const method = res.req && res.req.method ? res.req.method.toUpperCase() : "";
+  if (["POST", "PUT", "PATCH", "DELETE"].indexOf(method) === -1) return;
+  if (status >= 400) return;
+  res.__persist();
 }
 
 function readBody(req) {
@@ -101,16 +84,6 @@ function bearerToken(req) {
   return header.startsWith("Bearer ") ? header.slice("Bearer ".length) : "";
 }
 
-function createToken(user) {
-  const timestamp = Date.now().toString(36);
-  const signature = crypto
-    .createHmac("sha256", config.JWT_SECRET || "development-secret")
-    .update(`${user.id}:${user.email}:${timestamp}`)
-    .digest("hex")
-    .slice(0, 24);
-  return `st_${Buffer.from(`${user.id}:${timestamp}`).toString("base64url")}.${signature}`;
-}
-
 function appendEvent(store, type, payload) {
   store.events.unshift({
     id: createId(),
@@ -135,13 +108,100 @@ function appendAlert(store, severity, message, source) {
 
 function requireAuth(store, req, res) {
   const token = bearerToken(req);
+  touchSession(store, token);
   const userId = store.tokens.get(token);
   const user = store.users.find((item) => item.id === userId);
-  if (!token || !user) {
+  if (!token || !user || user.suspended) {
     json(res, 401, { success: false, error: "Unauthorized" });
     return null;
   }
   return user;
+}
+
+function requestMetadata(req) {
+  return {
+    userAgent: req.headers["user-agent"] || "",
+    ipAddress: req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : ""
+  };
+}
+
+function trimStoredCollection(list, limit) {
+  return Array.isArray(list) ? list.slice(0, limit) : [];
+}
+
+function normalizeEmail(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
+function validateCredentials(email, password, name) {
+  if (!email || !password || (name !== undefined && !name)) {
+    return "Missing required fields";
+  }
+  if (String(password).length < 8) {
+    return "Password must be at least 8 characters";
+  }
+  return "";
+}
+
+function rateLimitKey(req, scope) {
+  const address = req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : "unknown";
+  return `${scope}:${address}`;
+}
+
+function isRateLimited(store, req, scope, options = {}) {
+  const now = Date.now();
+  const windowMs = Number(options.windowMs || 60000);
+  const maxRequests = Number(options.maxRequests || 60);
+  const key = rateLimitKey(req, scope);
+  const entry = store.rateLimits[key] || { timestamps: [] };
+  entry.timestamps = entry.timestamps.filter((timestamp) => now - timestamp < windowMs);
+  entry.timestamps.push(now);
+  store.rateLimits[key] = entry;
+  return entry.timestamps.length > maxRequests;
+}
+
+function rejectIfRateLimited(store, req, res, scope, options) {
+  if (isRateLimited(store, req, scope, options)) {
+    json(res, 429, { success: false, error: "Rate limit exceeded. Retry later." });
+    return true;
+  }
+  return false;
+}
+
+function idempotencyKey(req) {
+  const header = req.headers["idempotency-key"];
+  return typeof header === "string" ? header.trim().slice(0, 120) : "";
+}
+
+function replayIdempotentResponse(store, req, res) {
+  const key = idempotencyKey(req);
+  if (!key) return false;
+  const match = (store.idempotencyKeys || []).find((item) => item.key === key && item.method === req.method && item.path === req.url);
+  if (!match) return false;
+  json(res, match.status || 200, Object.assign({ idempotentReplay: true }, match.payload));
+  return true;
+}
+
+function rememberIdempotentResponse(store, req, status, payload) {
+  const key = idempotencyKey(req);
+  if (!key || status >= 400) return;
+  store.idempotencyKeys = trimStoredCollection([
+    {
+      key,
+      method: req.method,
+      path: req.url,
+      status,
+      payload,
+      createdAt: new Date().toISOString()
+    }
+  ].concat(store.idempotencyKeys || []).filter((item, index, array) => {
+    return array.findIndex((candidate) => candidate.key === item.key && candidate.method === item.method && candidate.path === item.path) === index;
+  }), 250);
+}
+
+function sendJson(store, req, res, status, payload, headers) {
+  rememberIdempotentResponse(store, req, status, payload);
+  json(res, status, payload, headers);
 }
 
 function summarizeText(text) {
@@ -232,6 +292,13 @@ function route(req, res, store) {
   const requestUrl = new URL(req.url, `http://${req.headers.host || `${config.HOST}:${config.PORT}`}`);
   const pathname = requestUrl.pathname;
 
+  if (rejectIfRateLimited(store, req, res, pathname.startsWith("/api/admin") ? "admin" : "api", {
+    windowMs: pathname.startsWith("/api/auth") ? 60000 : 30000,
+    maxRequests: pathname.startsWith("/api/auth") ? 20 : 120
+  })) {
+    return;
+  }
+
   if (req.method === "GET" && pathname === "/api/health") {
     json(res, 200, {
       status: "ok",
@@ -259,50 +326,66 @@ function route(req, res, store) {
   }
 
   if (req.method === "POST" && pathname === "/api/auth/register") {
+    if (replayIdempotentResponse(store, req, res)) return;
     readBody(req).then((body) => {
-      const email = String(body.email || "").trim().toLowerCase();
+      const email = normalizeEmail(body.email);
       const password = String(body.password || "");
       const name = String(body.name || "").trim();
-      if (!email || !password || !name) {
-        json(res, 400, { success: false, error: "Missing required fields" });
+      const credentialError = validateCredentials(email, password, name);
+      if (credentialError) {
+        sendJson(store, req, res, 400, { success: false, error: credentialError });
         return;
       }
       if (store.users.some((user) => user.email === email)) {
-        json(res, 409, { success: false, error: "Email already exists" });
+        sendJson(store, req, res, 409, { success: false, error: "Email already exists" });
         return;
       }
+      const hashed = hashPassword(password);
       const user = {
         id: createId(),
         email,
-        password,
+        passwordHash: hashed.passwordHash,
+        passwordSalt: hashed.passwordSalt,
         name,
         credits: 10,
         role: "user",
         createdAt: new Date().toISOString()
       };
       store.users.push(user);
-      const token = createToken(user);
-      store.tokens.set(token, user.id);
+      const token = createSession(store, user.id, requestMetadata(req));
       appendEvent(store, "user.registered", { userId: user.id, email });
-      json(res, 201, { success: true, user: clonePublicUser(user), token });
-    }).catch((error) => json(res, 400, { success: false, error: error.message }));
+      sendJson(store, req, res, 201, { success: true, user: clonePublicUser(user), token });
+    }).catch((error) => sendJson(store, req, res, 400, { success: false, error: error.message }));
     return;
   }
 
   if (req.method === "POST" && pathname === "/api/auth/login") {
+    if (replayIdempotentResponse(store, req, res)) return;
     readBody(req).then((body) => {
-      const email = String(body.email || "").trim().toLowerCase();
+      const email = normalizeEmail(body.email);
       const password = String(body.password || "");
-      const user = store.users.find((item) => item.email === email && item.password === password);
-      if (!user) {
-        json(res, 401, { success: false, error: "Invalid credentials" });
+      const user = store.users.find((item) => item.email === email);
+      if (!user || !verifyPassword(user, password) || user.suspended) {
+        sendJson(store, req, res, 401, { success: false, error: "Invalid credentials" });
         return;
       }
-      const token = createToken(user);
-      store.tokens.set(token, user.id);
+      if (!user.passwordHash || !user.passwordSalt) {
+        const migrated = hashPassword(password);
+        user.passwordHash = migrated.passwordHash;
+        user.passwordSalt = migrated.passwordSalt;
+        delete user.password;
+      }
+      const token = createSession(store, user.id, requestMetadata(req));
       appendEvent(store, "user.logged_in", { userId: user.id });
-      json(res, 200, { success: true, user: clonePublicUser(user), token });
-    }).catch((error) => json(res, 400, { success: false, error: error.message }));
+      sendJson(store, req, res, 200, { success: true, user: clonePublicUser(user), token });
+    }).catch((error) => sendJson(store, req, res, 400, { success: false, error: error.message }));
+    return;
+  }
+
+  if (req.method === "POST" && pathname === "/api/auth/logout") {
+    const token = bearerToken(req);
+    const revoked = revokeSession(store, token);
+    sendJson(store, req, res, 200, { success: true, revoked });
     return;
   }
 
@@ -311,16 +394,16 @@ function route(req, res, store) {
       const email = String(body.email || "").trim().toLowerCase();
       const password = String(body.password || "");
       if (email !== String(config.ADMIN_EMAIL).trim().toLowerCase() || password !== config.ADMIN_PASSWORD) {
-        json(res, 401, { success: false, error: "Invalid admin credentials" });
+        sendJson(store, req, res, 401, { success: false, error: "Invalid admin credentials" });
         return;
       }
       appendEvent(store, "admin.logged_in", { email });
-      json(res, 200, {
+      sendJson(store, req, res, 200, {
         success: true,
         token: adminToken(),
         admin: { email: config.ADMIN_EMAIL, role: "admin" }
       });
-    }).catch((error) => json(res, 400, { success: false, error: error.message }));
+    }).catch((error) => sendJson(store, req, res, 400, { success: false, error: error.message }));
     return;
   }
 
@@ -578,17 +661,18 @@ function route(req, res, store) {
   if (req.method === "POST" && pathname === "/api/summarize") {
     const user = requireAuth(store, req, res);
     if (!user) return;
+    if (replayIdempotentResponse(store, req, res)) return;
     readBody(req).then((body) => {
       const validationError = validateSummarizePayload(body);
       if (validationError) {
-        json(res, validationError === "Text too short" || validationError === "Text is required" ? 400 : 422, {
+        sendJson(store, req, res, validationError === "Text too short" || validationError === "Text is required" ? 400 : 422, {
           success: false,
           error: validationError
         });
         return;
       }
       if (user.credits < 5) {
-        json(res, 402, { success: false, error: "Insufficient credits" });
+        sendJson(store, req, res, 402, { success: false, error: "Insufficient credits" });
         return;
       }
       user.credits -= 5;
@@ -606,6 +690,7 @@ function route(req, res, store) {
         store.proxyUsage[user.id] = (store.proxyUsage[user.id] || 0) + 1;
       }
       store.summaries.unshift(summary);
+      store.summaries = trimStoredCollection(store.summaries, 500);
       store.transactions.unshift({
         id: createId(),
         userId: user.id,
@@ -613,15 +698,17 @@ function route(req, res, store) {
         credits: -5,
         createdAt: summary.createdAt
       });
+      store.transactions = trimStoredCollection(store.transactions, 500);
       appendEvent(store, "summary.created", { userId: user.id, summaryId: summary.id, providerMode: summary.providerMode });
-      json(res, 200, { success: true, result: summary, user: clonePublicUser(user) });
-    }).catch((error) => json(res, 400, { success: false, error: error.message }));
+      sendJson(store, req, res, 200, { success: true, result: summary, user: clonePublicUser(user) });
+    }).catch((error) => sendJson(store, req, res, 400, { success: false, error: error.message }));
     return;
   }
 
   if (req.method === "POST" && pathname === "/api/credits/purchase") {
     const user = requireAuth(store, req, res);
     if (!user) return;
+    if (replayIdempotentResponse(store, req, res)) return;
     readBody(req).then((body) => {
       const packageType = String(body.package || "");
       const packages = {
@@ -631,7 +718,7 @@ function route(req, res, store) {
       };
       const selected = packages[packageType];
       if (!selected || !body.paymentMethodId) {
-        json(res, 400, { success: false, error: "Missing or invalid purchase request" });
+        sendJson(store, req, res, 400, { success: false, error: "Missing or invalid purchase request" });
         return;
       }
       user.credits += selected.credits;
@@ -645,9 +732,10 @@ function route(req, res, store) {
         createdAt: new Date().toISOString()
       };
       store.transactions.unshift(transaction);
+      store.transactions = trimStoredCollection(store.transactions, 500);
       appendEvent(store, "credits.purchased", { userId: user.id, transactionId: transaction.id });
-      json(res, 200, { success: true, transaction, user: clonePublicUser(user) });
-    }).catch((error) => json(res, 400, { success: false, error: error.message }));
+      sendJson(store, req, res, 200, { success: true, transaction, user: clonePublicUser(user) });
+    }).catch((error) => sendJson(store, req, res, 400, { success: false, error: error.message }));
     return;
   }
 
@@ -697,6 +785,7 @@ function route(req, res, store) {
 
   if (req.method === "POST" && pathname === "/api/admin/credits/bulk-adjust") {
     if (!requireAdmin(req, res)) return;
+    if (replayIdempotentResponse(store, req, res)) return;
     readBody(req).then((body) => {
       const adjustments = Array.isArray(body.adjustments) ? body.adjustments : [];
       const results = adjustments.map((item) => {
@@ -719,11 +808,12 @@ function route(req, res, store) {
           createdAt: new Date().toISOString()
         };
         store.transactions.unshift(transaction);
+        store.transactions = trimStoredCollection(store.transactions, 500);
         appendEvent(store, "admin.bulk_credits_adjusted", { userId: user.id, amount });
         return { userId: user.id, success: true, credits: user.credits, transactionId: transaction.id };
       });
-      json(res, 200, { success: true, results });
-    }).catch((error) => json(res, 400, { success: false, error: error.message }));
+      sendJson(store, req, res, 200, { success: true, results });
+    }).catch((error) => sendJson(store, req, res, 400, { success: false, error: error.message }));
     return;
   }
 
@@ -1130,7 +1220,7 @@ function route(req, res, store) {
 }
 
 function createBackendApp(options) {
-  const store = options && options.store ? options.store : createStore();
+  const store = options && options.store ? options.store : createStore(options && options.storagePath);
   const readiness = config.backendReadiness();
   if (!readiness.ok) {
     readiness.missing.forEach((name) => {
@@ -1143,6 +1233,11 @@ function createBackendApp(options) {
   return {
     store,
     handle(req, res) {
+      res.__persist = function persistStore() {
+        if (store && typeof store.persist === "function") {
+          store.persist();
+        }
+      };
       // Security headers
       res.setHeader("X-Content-Type-Options", "nosniff");
       res.setHeader("X-Frame-Options", "DENY");
@@ -1152,7 +1247,7 @@ function createBackendApp(options) {
       const origin = req.headers.origin || "*";
       res.setHeader("Access-Control-Allow-Origin", origin);
       res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+      res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Idempotency-Key");
       res.setHeader("Access-Control-Max-Age", "86400");
 
       if (req.method === "OPTIONS") {
