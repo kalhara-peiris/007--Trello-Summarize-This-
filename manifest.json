@@ -27,7 +27,7 @@
   ],
   "connectors": {
     "iframe": {
-      "url": "./connector.js"
+      "url": "./connector.html"
     }
   }
 }

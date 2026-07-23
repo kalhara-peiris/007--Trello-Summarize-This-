@@ -38,7 +38,7 @@ class AttachmentProcessor {
 
         const processed = [];
         for (const attachment of source.slice(0, 25)) {
-            if (!this.isTextLikeAttachment(attachment)) {
+            if (!this.isSafeExtractableAttachment(attachment)) {
                 processed.push(this.metadataOnlyAttachment(attachment, 'not-text-like'));
                 continue;
             }
@@ -76,12 +76,16 @@ class AttachmentProcessor {
                 failed: failed,
                 skipped: Math.max(source.length - attempted, 0),
                 detail: extracted
-                    ? `${extracted} text attachment(s) extracted with bounded HTTPS reads.`
+                    ? `${extracted} attachment(s) extracted with bounded HTTPS reads.`
                     : attempted
-                        ? 'Text attachment extraction ran, but no text was extracted.'
-                        : 'No text-like attachments were eligible for extraction.'
+                        ? 'Attachment extraction ran, but no text was extracted.'
+                        : 'No eligible text or PDF attachments were extracted.'
             }
         };
+    }
+
+    isSafeExtractableAttachment(attachment) {
+        return this.isTextLikeAttachment(attachment) || this.detectType(attachment) === 'pdf';
     }
 
     isTextLikeAttachment(attachment) {
@@ -94,6 +98,10 @@ class AttachmentProcessor {
     }
 
     async processSafeTextAttachment(attachment, limits) {
+        if (this.detectType(attachment) === 'pdf') {
+            return this.processSafePdfAttachment(attachment, limits);
+        }
+
         if (!attachment || !attachment.url) {
             throw new Error('Attachment has no fetchable URL');
         }
@@ -137,6 +145,71 @@ class AttachmentProcessor {
                 originalCharacters: normalizedText.length,
                 extractedCharacters: extractedText.length,
                 lines: lines.length,
+                truncated: truncated
+            }
+        };
+    }
+
+    async processSafePdfAttachment(attachment, limits) {
+        if (!attachment || !attachment.url) {
+            throw new Error('Attachment has no fetchable URL');
+        }
+
+        const knownBytes = Number(attachment.bytes || attachment.size || 0);
+        if (knownBytes > limits.maxBytes) {
+            throw new Error(`Attachment is larger than the ${this.formatBytes(limits.maxBytes)} PDF extraction cap`);
+        }
+
+        const response = await this.safeFetchAttachment(attachment.url, {
+            timeoutMs: limits.timeoutMs,
+            headers: { Accept: 'application/pdf,*/*;q=0.2' }
+        });
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch PDF attachment: ${response.statusText || response.status}`);
+        }
+
+        const blob = await response.blob();
+        if (blob.size > limits.maxBytes) {
+            throw new Error(`Attachment response is larger than the ${this.formatBytes(limits.maxBytes)} PDF extraction cap`);
+        }
+
+        const arrayBuffer = await blob.arrayBuffer();
+        const decodedText = this.extractTextFromPdfBuffer(arrayBuffer);
+        if (!decodedText) {
+            return {
+                ...attachment,
+                processed: false,
+                type: 'pdf',
+                extractionStatus: 'pdf-no-readable-text',
+                extractedText: '',
+                content: `PDF document: ${attachment.name || 'Attachment'}\n\nNo readable text could be extracted from this PDF within the safe browser limit.`,
+                metadata: {
+                    size: blob.size,
+                    formattedSize: this.formatBytes(blob.size),
+                    type: 'application/pdf',
+                    extractedCharacters: 0,
+                    truncated: false
+                }
+            };
+        }
+
+        const extractedText = decodedText.slice(0, limits.maxExtractedCharacters);
+        const truncated = decodedText.length > extractedText.length;
+
+        return {
+            ...attachment,
+            processed: true,
+            type: 'pdf',
+            extractionStatus: 'pdf-text-extracted',
+            extractedText: extractedText,
+            content: `PDF attachment: ${attachment.name || 'Attachment'}\n\n${extractedText}${truncated ? '\n\n[PDF text truncated before analysis]' : ''}`,
+            metadata: {
+                size: blob.size,
+                formattedSize: this.formatBytes(blob.size),
+                type: 'application/pdf',
+                originalCharacters: decodedText.length,
+                extractedCharacters: extractedText.length,
                 truncated: truncated
             }
         };
@@ -291,32 +364,7 @@ class AttachmentProcessor {
     // Process PDF files using PDF.js
     async processPDF(attachment) {
         try {
-            // For browser environment, we'll use a simplified approach
-            // In production, you'd want to use PDF.js library
-            
-            // Check if we can fetch the PDF
-            const response = await this.safeFetchAttachment(attachment.url);
-            if (!response.ok) {
-                throw new Error(`Failed to fetch PDF: ${response.statusText}`);
-            }
-
-            const blob = await response.blob();
-            const size = this.formatBytes(blob.size);
-
-            // For now, return metadata
-            // TODO: Implement actual PDF text extraction with PDF.js
-            return {
-                ...attachment,
-                processed: true,
-                type: 'pdf',
-                extractedText: '',
-                content: `PDF Document: ${attachment.name} (${size})\n\nNote: PDF text extraction requires PDF.js library. Currently showing metadata only.`,
-                metadata: {
-                    size: blob.size,
-                    formattedSize: size,
-                    type: 'application/pdf'
-                }
-            };
+            return await this.processSafePdfAttachment(attachment, this.normalizeExtractionLimits({}));
         } catch (error) {
             throw new Error(`PDF processing failed: ${error.message}`);
         }
@@ -528,6 +576,90 @@ class AttachmentProcessor {
         text = text.replace(/\s+/g, ' ').trim();
         
         return text;
+    }
+
+    extractTextFromPdfBuffer(arrayBuffer) {
+        const bytes = new Uint8Array(arrayBuffer || new ArrayBuffer(0));
+        if (!bytes.length) {
+            return '';
+        }
+
+        let binary = '';
+        const chunkSize = 8192;
+        for (let index = 0; index < bytes.length; index += chunkSize) {
+            const chunk = bytes.subarray(index, Math.min(index + chunkSize, bytes.length));
+            binary += String.fromCharCode.apply(null, chunk);
+        }
+
+        const streams = [];
+        const streamPattern = /stream\r?\n([\s\S]*?)endstream/g;
+        let match;
+        while ((match = streamPattern.exec(binary))) {
+            streams.push(match[1]);
+        }
+
+        const fragments = [];
+        const source = streams.length ? streams.join('\n') : binary;
+        const literalMatches = source.match(/\((?:\\.|[^\\()]){2,}\)/g) || [];
+        literalMatches.forEach((value) => {
+            const decoded = this.decodePdfLiteralString(value.slice(1, -1));
+            if (decoded) {
+                fragments.push(decoded);
+            }
+        });
+
+        const hexMatches = source.match(/<([0-9A-Fa-f\s]{8,})>/g) || [];
+        hexMatches.forEach((value) => {
+            const decoded = this.decodePdfHexString(value.slice(1, -1));
+            if (decoded) {
+                fragments.push(decoded);
+            }
+        });
+
+        const normalized = fragments
+            .join('\n')
+            .replace(/\r\n/g, '\n')
+            .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, ' ')
+            .replace(/[ \t]{2,}/g, ' ')
+            .replace(/\n{3,}/g, '\n\n')
+            .trim();
+
+        return normalized;
+    }
+
+    decodePdfLiteralString(value) {
+        if (!value) return '';
+        const decoded = value
+            .replace(/\\n/g, '\n')
+            .replace(/\\r/g, '\r')
+            .replace(/\\t/g, '\t')
+            .replace(/\\b/g, '\b')
+            .replace(/\\f/g, '\f')
+            .replace(/\\\(/g, '(')
+            .replace(/\\\)/g, ')')
+            .replace(/\\\\/g, '\\')
+            .replace(/\\([0-7]{1,3})/g, function (_match, octal) {
+                return String.fromCharCode(parseInt(octal, 8));
+            });
+        return decoded.replace(/\s+/g, ' ').trim();
+    }
+
+    decodePdfHexString(value) {
+        const compact = String(value || '').replace(/\s+/g, '');
+        if (!compact) return '';
+        const padded = compact.length % 2 === 0 ? compact : compact + '0';
+        let output = '';
+        for (let index = 0; index < padded.length; index += 2) {
+            const code = parseInt(padded.slice(index, index + 2), 16);
+            if (Number.isFinite(code) && code >= 32 && code <= 126) {
+                output += String.fromCharCode(code);
+            } else if (code === 10 || code === 13) {
+                output += '\n';
+            } else {
+                output += ' ';
+            }
+        }
+        return output.replace(/\s+/g, ' ').trim();
     }
 
     // Fetch attachment content only after basic URL safety checks.
